@@ -5,6 +5,82 @@ struct TranscriptionToolContext {
     let preferredLocale: Locale?
 }
 
+enum TranscriptionScope: Equatable {
+    case automatic
+    case clips(ids: [String])
+    case track(id: String)
+
+    @MainActor
+    func targets(in editor: EditorViewModel) -> [Clip] {
+        switch self {
+        case .automatic:
+            editor.captionTargets(ids: [])
+        case .clips(let ids):
+            editor.transcriptionTargets(clipIds: ids)
+        case .track(let id):
+            editor.captionTargets(trackIds: [id])
+        }
+    }
+
+    @MainActor
+    func captionRequest(
+        in editor: EditorViewModel,
+        provider: TranscriptionProvider
+    ) -> EditorViewModel.CaptionRequest {
+        switch self {
+        case .automatic:
+            EditorViewModel.CaptionRequest(autoDetect: true, provider: provider)
+        case .clips, .track:
+            EditorViewModel.CaptionRequest(
+                sourceClipIds: targets(in: editor).map(\.id),
+                provider: provider
+            )
+        }
+    }
+}
+
+struct TranscriptTargetSnapshot: Equatable {
+    let clipId: String
+    let mediaRef: String
+    let startFrame: Int
+    let durationFrames: Int
+    let trimStartFrame: Int
+    let speed: Double
+
+    init(_ clip: Clip) {
+        clipId = clip.id
+        mediaRef = clip.mediaRef
+        startFrame = clip.startFrame
+        durationFrames = clip.durationFrames
+        trimStartFrame = clip.trimStartFrame
+        speed = clip.speed
+    }
+}
+
+struct TranscriptSession {
+    let context: TranscriptionToolContext
+    let scope: TranscriptionScope
+    let timelineId: String
+    let timelineFPS: Int
+    let targetSnapshot: [TranscriptTargetSnapshot]
+
+    @MainActor
+    init(context: TranscriptionToolContext, scope: TranscriptionScope, editor: EditorViewModel) {
+        self.context = context
+        self.scope = scope
+        timelineId = editor.activeTimelineId
+        timelineFPS = editor.timeline.fps
+        targetSnapshot = scope.targets(in: editor).map(TranscriptTargetSnapshot.init)
+    }
+
+    @MainActor
+    func hasSameWordMapping(in editor: EditorViewModel) -> Bool {
+        timelineId == editor.activeTimelineId
+            && timelineFPS == editor.timeline.fps
+            && targetSnapshot == scope.targets(in: editor).map(TranscriptTargetSnapshot.init)
+    }
+}
+
 struct TimelineWord {
     let index: Int
     let clipId: String
@@ -24,10 +100,6 @@ struct TimelineTranscript {
 
     var includesSpeakers: Bool {
         words.contains { $0.speaker != nil }
-    }
-
-    var wordFormat: [String] {
-        includesSpeakers ? ["index", "text", "start", "end", "speaker"] : ["index", "text", "start", "end"]
     }
 
     func groups(clipId filter: String? = nil) -> [TimelineTranscriptGroup] {
@@ -51,40 +123,62 @@ struct TimelineTranscript {
         return groups
     }
 
-    func responsePayload(fps: Int, clipId: String?, startFrame: Int?, endFrame: Int?, maxWords: Int) -> [String: Any] {
+    func responsePayload(
+        fps: Int, clipId: String?, startFrame: Int?, endFrame: Int?, maxWords: Int, segments: Bool = false
+    ) -> [String: Any] {
         var clipsOut: [[String: Any]] = []
         var totalWords = 0
         var remaining = maxWords
         var lastEnd: Int?
+        var speakerRuns: [[Any]] = []
+        var currentSpeaker: String??
 
         for group in groups(clipId: clipId) {
-            var rows: [[Any]] = []
+            var visible: [TimelineWord] = []
             for word in group.words {
                 if let startFrame, word.endFrame <= startFrame { continue }
                 if let endFrame, word.startFrame >= endFrame { continue }
                 totalWords += 1
                 guard remaining > 0 else { continue }
-                rows.append(row(for: word))
+                visible.append(word)
                 remaining -= 1
                 lastEnd = word.endFrame
+                // Speakers as run-length turns, not a column repeated on every word.
+                if includesSpeakers, currentSpeaker != word.speaker {
+                    currentSpeaker = word.speaker
+                    speakerRuns.append([word.index, word.speaker ?? NSNull()])
+                }
             }
-            guard !rows.isEmpty else { continue }
-            clipsOut.append([
+            guard !visible.isEmpty else { continue }
+            var clipOut: [String: Any] = [
                 "clipId": group.clipId,
                 "trackIndex": group.trackIndex,
                 "startFrame": group.clipStartFrame,
                 "endFrame": group.clipEndFrame,
-                "words": rows,
-            ])
+            ]
+            if segments {
+                clipOut["segments"] = Self.segmentRows(visible, fps: fps)
+            } else {
+                clipOut["words"] = visible.map { [$0.index, $0.text, $0.startFrame] }
+            }
+            clipsOut.append(clipOut)
         }
 
         var out: [String: Any] = [
             "fps": fps,
             "timing": "projectFrames",
             "transcriptionSource": context.provider.rawValue,
-            "wordFormat": wordFormat,
             "clips": clipsOut,
         ]
+        if segments {
+            out["segmentFormat"] = ["firstWordIndex", "text", "start", "end"]
+        } else {
+            out["wordFormat"] = ["index", "text", "start"]
+        }
+        if includesSpeakers, !speakerRuns.isEmpty {
+            out["speakers"] = speakerRuns
+            out["speakersNote"] = "[firstWordIndex, speaker] — each run holds until the next entry."
+        }
         if totalWords > maxWords {
             out["totalWords"] = totalWords
             if let lastEnd {
@@ -96,11 +190,27 @@ struct TimelineTranscript {
         return out
     }
 
-    private func row(for word: TimelineWord) -> [Any] {
-        if includesSpeakers {
-            return [word.index, word.text, word.startFrame, word.endFrame, word.speaker ?? NSNull()]
+    /// Sentence-ish rows for comprehension reads; firstWordIndex is the handle back into word mode.
+    private static func segmentRows(_ words: [TimelineWord], fps: Int) -> [[Any]] {
+        var rows: [[Any]] = []
+        var run: [TimelineWord] = []
+        func flush() {
+            guard let first = run.first, let last = run.last else { return }
+            rows.append([first.index, run.map(\.text).joined(separator: " "), first.startFrame, last.endFrame])
+            run.removeAll()
         }
-        return [word.index, word.text, word.startFrame, word.endFrame]
+        for word in words {
+            if let last = run.last,
+               last.speaker != word.speaker || word.startFrame - last.endFrame > fps || run.count >= 48 {
+                flush()
+            }
+            run.append(word)
+            if word.text.hasSuffix(".") || word.text.hasSuffix("!") || word.text.hasSuffix("?") {
+                flush()
+            }
+        }
+        flush()
+        return rows
     }
 }
 
@@ -123,18 +233,77 @@ extension ToolExecutor {
     static let transcriptWordLimit = 10000
 
     private static let inspectMaxSegments = 400
-    private static let getTranscriptAllowedKeys: Set<String> = ["startFrame", "endFrame", "clipId", "wordTimestamps", "language"]
+    private static let getTranscriptAllowedKeys: Set<String> = ["startFrame", "endFrame", "clipId", "trackIndex", "wordTimestamps", "language", "granularity"]
 
-    func transcriptionContext(_ args: [String: Any], path: String, preferLast: Bool = false) async throws -> TranscriptionToolContext {
-        if preferLast, let lastTranscriptContext {
-            return lastTranscriptContext
+    func resolveTranscriptionScope(
+        _ editor: EditorViewModel,
+        _ args: [String: Any],
+        path: String
+    ) throws -> TranscriptionScope {
+        let clipId = args.string("clipId")
+        guard let rawTrackIndex = args["trackIndex"] else {
+            guard let clipId else { return .automatic }
+            guard editor.findClip(id: clipId) != nil else {
+                throw ToolError("Clip \(clipId) not found.")
+            }
+            let scope = TranscriptionScope.clips(ids: [clipId])
+            if !scope.targets(in: editor).isEmpty { return scope }
+            if let linked = linkedAudioScope(for: [clipId], editor: editor) { return linked }
+            throw ToolError("Clip \(clipId) has no transcribable audio.")
         }
+        guard clipId == nil else {
+            throw ToolError("\(path): pass either clipId or trackIndex, not both.")
+        }
+        guard let trackIndex = exactJSONInt(rawTrackIndex) else {
+            throw ToolError("\(path): trackIndex must be an integer.")
+        }
+        guard editor.timeline.tracks.indices.contains(trackIndex) else {
+            let validRange = editor.timeline.tracks.isEmpty
+                ? "the timeline has no tracks"
+                : "valid range: 0..\(editor.timeline.tracks.count - 1)"
+            throw ToolError("\(path): trackIndex \(trackIndex) is out of range (\(validRange)).")
+        }
+        let track = editor.timeline.tracks[trackIndex]
+        let scope = TranscriptionScope.track(id: track.id)
+        if !scope.targets(in: editor).isEmpty { return scope }
+        if let linked = linkedAudioScope(for: track.clips.map(\.id), editor: editor) {
+            return linked
+        }
+        throw ToolError("\(path): track \(trackIndex) has no transcribable audio.")
+    }
+
+    private func linkedAudioScope(
+        for clipIds: [String],
+        editor: EditorViewModel
+    ) -> TranscriptionScope? {
+        let partnerIds = clipIds.flatMap { editor.linkedPartnerIds(of: $0) }
+        guard !partnerIds.isEmpty else { return nil }
+        let scope = TranscriptionScope.clips(ids: partnerIds)
+        return scope.targets(in: editor).isEmpty ? nil : scope
+    }
+
+    func transcriptionContext(
+        _ args: [String: Any],
+        path: String,
+        estimatedCloudCost: () async -> Int
+    ) async throws -> TranscriptionToolContext {
         let account = AccountService.shared
-        let provider: TranscriptionProvider = account.isSignedIn && account.hasCredits ? .cloud : .local
+        let cost = await estimatedCloudCost()
+        let provider: TranscriptionProvider = Self.canUseCloudTranscription(
+            isSignedIn: account.isSignedIn,
+            remainingCredits: account.remainingCredits,
+            estimatedCost: cost
+        ) ? .cloud : .local
         return TranscriptionToolContext(
             provider: provider,
             preferredLocale: provider == .cloud ? nil : try await Self.parseLocale(args, path: path)
         )
+    }
+
+    static func canUseCloudTranscription(isSignedIn: Bool, remainingCredits: Int, estimatedCost: Int) -> Bool {
+        guard isSignedIn else { return false }
+        guard estimatedCost > 0 else { return true }
+        return remainingCredits >= estimatedCost
     }
 
     static func parseLocale(_ args: [String: Any], path: String) async throws -> Locale? {
@@ -155,71 +324,73 @@ extension ToolExecutor {
         let remaining = account.remainingCredits
         guard remaining > 0 else { throw ToolError("Add credits to use Cloud transcription.") }
         if cost > remaining {
-            throw ToolError("\(CostEstimator.format(cost)) needed. Only \(remaining.formatted()) remaining.")
+            throw ToolError("\(CostEstimator.stableDescription(cost)) needed. Only \(remaining) remaining.")
         }
     }
 
     func getTranscript(_ editor: EditorViewModel, _ args: [String: Any]) async throws -> ToolResult {
         try validateUnknownKeys(args, allowed: Self.getTranscriptAllowedKeys, path: "get_transcript")
         let clipFilter = args.string("clipId")
-        let windowStart = args.int("startFrame")
-        let windowEnd = args.int("endFrame")
-        if let start = windowStart, let end = windowEnd, start >= end {
-            throw ToolError("startFrame (\(start)) must be less than endFrame (\(end))")
-        }
-        try validateTranscriptClipFilter(clipFilter, editor)
+        let window = try Self.frameWindow(args)
 
-        let context = try await transcriptionContext(args, path: "get_transcript")
-        let transcript = try await timelineTranscript(editor, context: context)
-        lastTranscriptContext = context
+        let granularity = args.string("granularity") ?? "words"
+        guard granularity == "words" || granularity == "segments" else {
+            throw ToolError("granularity must be 'words' or 'segments' (got '\(granularity)')")
+        }
+
+        let scope = try resolveTranscriptionScope(editor, args, path: "get_transcript")
+        let cloudRequest = scope.captionRequest(in: editor, provider: .cloud)
+        let context = try await transcriptionContext(args, path: "get_transcript") {
+            await editor.captionCloudCreditCost(for: cloudRequest)
+        }
+        let session = TranscriptSession(context: context, scope: scope, editor: editor)
+        let transcript = try await timelineTranscript(editor, session: session)
+        lastTranscriptSession = session
 
         let out = transcript.responsePayload(
             fps: editor.timeline.fps,
             clipId: clipFilter,
-            startFrame: windowStart,
-            endFrame: windowEnd,
-            maxWords: Self.transcriptWordLimit
+            startFrame: window?.lowerBound,
+            endFrame: window?.upperBound,
+            maxWords: Self.transcriptWordLimit,
+            segments: granularity == "segments"
         )
         guard let json = Self.jsonString(out) else { throw ToolError("Failed to encode transcript") }
         return .ok(json)
     }
 
-    func timelineTranscript(_ editor: EditorViewModel, context: TranscriptionToolContext) async throws -> TimelineTranscript {
-        if context.provider == .cloud {
-            let request = EditorViewModel.CaptionRequest(autoDetect: true, provider: .cloud)
+    func timelineTranscript(
+        _ editor: EditorViewModel,
+        session: TranscriptSession
+    ) async throws -> TimelineTranscript {
+        if session.context.provider == .cloud {
+            let request = session.scope.captionRequest(in: editor, provider: .cloud)
             try await Self.validateCloudTranscriptionAccess(for: request, in: editor)
         }
-        let (words, skipped) = try await timelineWords(editor, context: context)
-        return TimelineTranscript(context: context, words: words, skipped: skipped)
+        let (words, skipped) = try await timelineWords(editor, session: session)
+        return TimelineTranscript(context: session.context, words: words, skipped: skipped)
     }
 
-    private func validateTranscriptClipFilter(_ clipId: String?, _ editor: EditorViewModel) throws {
-        guard let clipId else { return }
-        guard editor.findClip(id: clipId) != nil else {
-            throw ToolError("Clip \(clipId) not found.")
-        }
-        guard editor.captionTargets(ids: []).contains(where: { $0.id == clipId }) else {
-            throw ToolError("Clip \(clipId) has no transcribable audio. If it's a video with linked audio, scope to the linked audio clip instead.")
-        }
-    }
-
-    private func timelineWords(_ editor: EditorViewModel, context: TranscriptionToolContext) async throws -> (words: [TimelineWord], skipped: [[String: Any]]) {
+    private func timelineWords(
+        _ editor: EditorViewModel,
+        session: TranscriptSession
+    ) async throws -> (words: [TimelineWord], skipped: [[String: Any]]) {
         let fps = editor.timeline.fps
         let assetsById = Dictionary(editor.mediaAssets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var fragments: [TranscriptFragment] = []
         var isVideoByURL: [URL: Bool] = [:]
-        for clip in editor.captionTargets(ids: []) {
+        for clip in session.scope.targets(in: editor) {
             guard let loc = editor.findClip(id: clip.id), let asset = assetsById[clip.mediaRef] else { continue }
             let isVideo = asset.type == .video
             fragments.append(TranscriptFragment(clipId: clip.id, trackIndex: loc.trackIndex, clip: clip, url: asset.url))
             isVideoByURL[asset.url] = isVideo
         }
 
-        let transcripts = await transcriptsByURL(
+        let transcripts = try await transcriptsByURL(
             for: fragments,
             fps: fps,
             projectId: editor.projectId,
-            context: context,
+            context: session.context,
             isVideoByURL: isVideoByURL
         )
 
@@ -291,7 +462,7 @@ extension ToolExecutor {
         }
         // Partial alignment would let a remapped label collide with an untouched local one.
         guard !map.isEmpty, files.allSatisfy({ map[$0.mediaRef] != nil }) else { return [:] }
-        for (url, refs) in refsByURL {
+        for refs in refsByURL.values {
             guard let primary = refs.first, let entry = map[primary] else { continue }
             for ref in refs.dropFirst() { map[ref] = entry }
         }
@@ -304,7 +475,7 @@ extension ToolExecutor {
         projectId: String?,
         context: TranscriptionToolContext,
         isVideoByURL: [URL: Bool]
-    ) async -> (results: [URL: TranscriptionResult], skipped: [[String: Any]]) {
+    ) async throws -> (results: [URL: TranscriptionResult], skipped: [[String: Any]]) {
         let rangesByURL = sourceRangesByURL(fragments, fps: fps)
         let outcomes = await withTaskGroup(of: (URL, Result<TranscriptionResult, Error>).self) { group in
             for url in Set(fragments.map(\.url)) {
@@ -335,6 +506,7 @@ extension ToolExecutor {
             for await outcome in group { collected.append(outcome) }
             return collected
         }
+        try Task.checkCancellation()
 
         var results: [URL: TranscriptionResult] = [:]
         var skipped: [[String: Any]] = []

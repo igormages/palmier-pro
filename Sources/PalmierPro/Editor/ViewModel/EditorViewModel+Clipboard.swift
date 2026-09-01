@@ -75,7 +75,7 @@ extension EditorViewModel {
             // A pasted nest must not make this timeline contain itself.
             if entry.clip.sourceClipType == .sequence,
                wouldCreateNestCycle(nesting: entry.clip.mediaRef, into: activeTimelineId) {
-                mediaPanelToast = "Can't paste \"\(clipDisplayLabel(for: entry.clip))\" here — it would nest this timeline inside itself."
+                mediaPanelToast = MediaPanelToast(message: L10n.string("Can't paste \"\(clipDisplayLabel(for: entry.clip))\" here — it would nest this timeline inside itself."))
                 continue
             }
             placements.append(ClonePlacement(
@@ -148,6 +148,7 @@ private extension EditorViewModel {
                 var clone = p.source
                 clone.startFrame = p.dstStart
                 clone.freshenIds(groups: &groups)
+                clone.multicamGroupId = nil
                 if let oldGroup = p.source.linkGroupId, (groupCounts[oldGroup] ?? 0) <= 1 {
                     clone.linkGroupId = nil
                 }

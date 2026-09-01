@@ -26,6 +26,10 @@ extension EditorViewModel {
         MediaFolderIndex(mediaManifest.folders).path(for: folderId)
     }
 
+    func folderIdsIncludingDescendants(_ ids: Set<String>) -> Set<String> {
+        MediaFolderIndex(mediaManifest.folders).idsIncludingDescendants(ids)
+    }
+
     private func assetIds(inFolderIds folderIds: Set<String>) -> Set<String> {
         Set(mediaAssets
             .filter { asset in asset.folderId.map { folderIds.contains($0) } ?? false }
@@ -39,10 +43,9 @@ extension EditorViewModel {
         let folder = MediaFolder(name: name, parentFolderId: parentFolderId)
         let id = folder.id
         mediaManifest.folders.append(folder)
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register("New Folder", withTarget: self) { vm in
             vm.deleteFolders(ids: [id])
         }
-        undoManager?.setActionName("New Folder")
         return id
     }
 
@@ -51,10 +54,9 @@ extension EditorViewModel {
         let oldName = mediaManifest.folders[idx].name
         guard oldName != name else { return }
         mediaManifest.folders[idx].name = name
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register("Rename Folder", withTarget: self) { vm in
             vm.renameFolder(id: id, name: oldName)
         }
-        undoManager?.setActionName("Rename Folder")
     }
 
     func deleteFolders(ids: Set<String>) {
@@ -78,10 +80,9 @@ extension EditorViewModel {
         selectedMediaAssetIds.subtract(assetIdsToDelete)
         for id in assetIdsToDelete { closePreviewTab(id: PreviewTab.mediaAssetTabId(for: id)) }
 
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register("Delete Folder", withTarget: self) { vm in
             vm.restoreMediaLibraryUndoSnapshot(before, actionName: "Delete Folder")
         }
-        undoManager?.setActionName("Delete Folder")
         if !clipIdsToRemove.isEmpty {
             notifyTimelineChanged()
         }
@@ -169,14 +170,14 @@ extension EditorViewModel {
             inverse.append((change.id, get(self, change.id)))
             set(self, change.id, change.newValue)
         }
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register(actionName, withTarget: self) { vm in
             vm.applyParentChanges(inverse, actionName: actionName, get: get, set: set)
         }
-        undoManager?.setActionName(actionName)
     }
 
     func mediaLibraryUndoSnapshot() -> MediaLibraryUndoSnapshot {
-        MediaLibraryUndoSnapshot(
+        flushPendingManifestMetadataUpdates()
+        return MediaLibraryUndoSnapshot(
             timelines: timelines,
             activeTimelineId: activeTimelineId,
             openTimelineIds: openTimelineIds,
@@ -206,10 +207,9 @@ extension EditorViewModel {
         previewTabs = snapshot.previewTabs
         activePreviewTabId = snapshot.activePreviewTabId
         sourcePlayheadFrame = snapshot.sourcePlayheadFrame
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register(actionName, withTarget: self) { vm in
             vm.restoreMediaLibraryUndoSnapshot(redo, actionName: actionName)
         }
-        undoManager?.setActionName(actionName)
         videoEngine?.activateTab(activePreviewTab)
         refreshMissingMediaCache()
         notifyTimelineChanged()

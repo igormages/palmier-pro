@@ -47,6 +47,10 @@ struct GenerationInput: Codable, Sendable, Equatable {
     var duration: Int
     var aspectRatio: String
     var resolution: String?
+    var upscaleSettings: UpscaleSettings? = nil
+    var upscaleSourceWidth: Int? = nil
+    var upscaleSourceHeight: Int? = nil
+    var upscaleSourceFPS: Double? = nil
     var quality: String?
     var imageURLs: [String]?
     /// Image-only
@@ -56,8 +60,13 @@ struct GenerationInput: Codable, Sendable, Equatable {
     var lyrics: String?
     var styleInstructions: String?
     var instrumental: Bool?
+    var targetLanguage: String?
+    var multilingual: Bool?
+    var audioInput: String?
     /// Video-only
     var generateAudio: Bool?
+    var draft: Bool?
+    var usesSourceVideo: Bool?
     var referenceImageURLs: [String]?
     var referenceVideoURLs: [String]?
     var referenceAudioURLs: [String]?
@@ -71,6 +80,8 @@ struct GenerationInput: Codable, Sendable, Equatable {
     var backendJobId: String?
     var outputIndex: Int?
     var resultURLs: [String]?
+    var costCredits: Int?
+    var refundedCredits: Int?
 }
 
 enum MediaSource: Codable, Sendable, Equatable {

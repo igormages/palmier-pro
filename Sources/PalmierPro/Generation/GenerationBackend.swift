@@ -16,12 +16,23 @@ enum GenerationBackend {
         )
     }
 
+    static func subscribeToProjectActivity(
+        projectId: String
+    ) -> AnyPublisher<[BackendProjectActivityEntry], ClientError>? {
+        guard let convex = AccountService.shared.convex else { return nil }
+        return convex.subscribe(
+            to: "generations:projectActivity",
+            with: ["projectId": projectId],
+            yielding: [BackendProjectActivityEntry].self,
+        )
+    }
+
     static func uploadReference(
         fileURL: URL,
         contentType: String,
     ) async throws -> String {
         guard let convex = AccountService.shared.convex else {
-            throw GenerationBackendError.notConfigured
+            throw BackendError.notConfigured
         }
         let storageId = try await BackendStorage.uploadStaged(fileURL: fileURL, contentType: contentType)
         let result: UrlResponse = try await convex.action(
@@ -37,7 +48,7 @@ enum GenerationBackend {
         projectId: String? = nil,
     ) async throws -> String {
         guard let convex = AccountService.shared.convex else {
-            throw GenerationBackendError.notConfigured
+            throw BackendError.notConfigured
         }
         let args: [String: ConvexEncodable?] = [
             "model": model,
@@ -47,6 +58,17 @@ enum GenerationBackend {
         let result: SubmitGenerationResult = try await convex.mutation(
             "generations:submit",
             with: args,
+        )
+        return result.jobId
+    }
+
+    static func enhanceDraft(sourceJobId: String) async throws -> String {
+        guard let convex = AccountService.shared.convex else {
+            throw BackendError.notConfigured
+        }
+        let result: SubmitGenerationResult = try await convex.mutation(
+            "generations:enhanceDraft",
+            with: ["sourceJobId": sourceJobId],
         )
         return result.jobId
     }
@@ -81,20 +103,29 @@ struct BackendGenerationJob: Decodable, Sendable {
     let resultUrls: [String]?
     let errorMessage: String?
     let costCredits: Int?
+    let refundedCredits: Int?
     let completedAt: Double?
 }
 
-enum GenerationBackendError: LocalizedError {
-    case notConfigured
-    case transport(String)
-    case api(status: Int, code: String, message: String)
+struct BackendProjectActivityEntry: Decodable, Sendable, Identifiable {
+    enum Kind: String, Decodable, Sendable {
+        case generation
+        case failed
+        case refund
+    }
 
-    var errorDescription: String? {
-        switch self {
-        case .notConfigured: return "Palmier backend not configured."
-        case .transport(let s): return s
-        case .api(_, _, let message): return message
-        }
+    let id: String
+    let kind: Kind
+    let model: String
+    let credits: Int
+    let createdAt: Double
+
+    var creditImpact: Int {
+        kind == .refund ? -credits : credits
+    }
+
+    var createdDate: Date {
+        Date(timeIntervalSince1970: createdAt / 1_000)
     }
 }
 

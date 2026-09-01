@@ -22,10 +22,12 @@ extension EditorViewModel {
             ?? file.timelines[0].id
         openTimelineIds = (file.openTimelineIds ?? []).filter { ids.contains($0) }
         speakerRegistry = file.speakers ?? []
+        multicamGroups = file.multicamGroups ?? []
         syncSpeakerColors()
         if !openTimelineIds.contains(activeTimelineId) {
             openTimelineIds.append(activeTimelineId)
         }
+        timelineTabBarExpandedOverride = nil
         restoreActiveViewState()
     }
 
@@ -38,7 +40,8 @@ extension EditorViewModel {
             activeTimelineId: activeTimelineId,
             openTimelineIds: openTimelineIds,
             viewStates: liveViewStates.filter { ids.contains($0.key) },
-            speakers: speakerRegistry.isEmpty ? nil : speakerRegistry
+            speakers: speakerRegistry.isEmpty ? nil : speakerRegistry,
+            multicamGroups: savedMulticamGroups()
         )
     }
 
@@ -59,6 +62,16 @@ extension EditorViewModel {
         zoomScale = vs.zoomScale
         currentFrame = min(max(0, vs.playheadFrame), max(0, timeline.totalFrames))
         timelineScrollRestoreX = vs.scrollOffsetX
+    }
+
+    @discardableResult
+    func selectAdjacentOpenTimeline(delta: Int) -> Bool {
+        guard let id = EditorViewModel.adjacentId(in: openTimelineIds, current: activeTimelineId, delta: delta) else {
+            return false
+        }
+        activateTimeline(id)
+        revealTimelineTabBarIfMultiple()
+        return true
     }
 
     func activateTimeline(_ id: String) {
@@ -92,15 +105,19 @@ extension EditorViewModel {
         selectedClipIds = []
         selectedGap = nil
         selectedTimelineRange = nil
+        selectedTimelineMarkerIds = []
+        timelineMarkerPreview = nil
         pendingSwapClipId = nil
+        pendingSwapTargetClipIds = []
+        clearAgentActivity()
         dragBefore = [:]
         preDragTimeline = nil
     }
 
     /// registerUndo that re-activates the owning timeline before applying.
-    func registerTimelineUndo(_ handler: @escaping @MainActor (EditorViewModel) -> Void) {
+    func registerTimelineUndo(_ actionName: String, _ handler: @escaping @MainActor (EditorViewModel) -> Void) {
         let tid = activeTimelineId
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register(actionName, withTarget: self) { vm in
             if vm.activeTimelineId != tid, vm.timelines.contains(where: { $0.id == tid }) {
                 vm.activateTimeline(tid)
             }
@@ -144,16 +161,15 @@ extension EditorViewModel {
         guard !trimmed.isEmpty, timelines[i].name != trimmed else { return }
         let previous = timelines[i].name
         timelines[i].name = trimmed
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register("Rename Timeline", withTarget: self) { vm in
             vm.renameTimeline(id, to: previous)
         }
-        undoManager?.setActionName("Rename Timeline")
     }
 
     func deleteTimeline(_ id: String) {
         guard let index = timelines.firstIndex(where: { $0.id == id }) else { return }
         guard timelines.count > 1 else {
-            mediaPanelToast = "Can't delete every timeline — the project needs at least one."
+            mediaPanelToast = MediaPanelToast(message: L10n.string("Can't delete every timeline — the project needs at least one."))
             return
         }
         let openIndex = openTimelineIds.firstIndex(of: id)
@@ -171,10 +187,12 @@ extension EditorViewModel {
         selectedTimelineIds.remove(id)
         videoEngine?.evictComposition(for: id)
         if let openIndex { openTimelineIds.remove(at: openIndex) }
-        undoManager?.registerUndo(withTarget: self) { vm in
+        if timelines.count <= 1 {
+            timelineTabBarExpandedOverride = nil
+        }
+        undo.register("Delete Timeline", withTarget: self) { vm in
             vm.reinsertTimeline(removed, viewState: removedViewState, at: index, openAt: openIndex, reactivate: wasActive)
         }
-        undoManager?.setActionName("Delete Timeline")
         if wasNestedInActive {
             notifyTimelineChanged(refreshVisuals: false)
         }
@@ -199,6 +217,17 @@ extension EditorViewModel {
         openTimelineIds = [id]
     }
 
+    func closeAllTimelineTabs() {
+        closeOtherTimelineTabs(keeping: activeTimelineId)
+    }
+
+    func openAllTimelineTabs() {
+        let opened = Set(openTimelineIds)
+        let missing = timelines.map(\.id).filter { !opened.contains($0) }
+        guard !missing.isEmpty else { return }
+        openTimelineIds.append(contentsOf: missing)
+    }
+
     private func reinsertTimeline(_ t: Timeline, viewState: TimelineViewState, at index: Int, openAt openIndex: Int?, reactivate: Bool) {
         timelines.insert(t, at: min(index, timelines.count))
         liveViewStates[t.id] = viewState
@@ -210,16 +239,15 @@ extension EditorViewModel {
         } else if isVisibleFromActive(t.id) {
             notifyTimelineChanged(refreshVisuals: false)
         }
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register("Delete Timeline", withTarget: self) { vm in
             vm.deleteTimeline(t.id)
         }
     }
 
     func registerRemoveUndo(for id: String, actionName: String) {
-        undoManager?.registerUndo(withTarget: self) { vm in
+        undo.register(actionName, withTarget: self) { vm in
             vm.deleteTimeline(id)
         }
-        undoManager?.setActionName(actionName)
     }
 
     /// Removes every clip referencing `assetIds` from every timeline; prunes emptied tracks.
@@ -269,5 +297,6 @@ extension Timeline {
                 tracks[ti].clips[ci].freshenIds(groups: &groups)
             }
         }
+        for i in markers.indices { markers[i].id = UUID().uuidString }
     }
 }

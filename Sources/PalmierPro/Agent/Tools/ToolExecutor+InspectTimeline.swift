@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import Foundation
 
 extension ToolExecutor {
@@ -22,7 +23,7 @@ extension ToolExecutor {
         }
 
         let sampledFrames: [Int]
-        if let rawEnd = args.int("endFrame") {
+        if let rawEnd = args.int("endFrame"), rawEnd != 0 {
             let endFrame = min(rawEnd, totalFrames)
             guard endFrame > startFrame else {
                 throw ToolError("endFrame must be greater than startFrame (\(startFrame)).")
@@ -64,7 +65,8 @@ extension ToolExecutor {
             let time = CMTime(value: CMTimeValue(frame), timescale: timescale)
             guard let videoCG = try? await generator.image(at: time).image else { continue }
             // videoComposition already composites text via CustomVideoCompositor.
-            guard let jpeg = ImageEncoder.encodeJPEG(videoCG, quality: Self.inspectTimelineJPEGQuality) else { continue }
+            let labeled = InspectFrameOverlay.apply(videoCG, caption: "f\(frame)")
+            guard let jpeg = ImageEncoder.encodeJPEG(labeled, quality: Self.inspectTimelineJPEGQuality) else { continue }
             imageBlocks.append(.image(base64: jpeg.base64EncodedString(), mediaType: "image/jpeg"))
             renderedFrames.append(frame)
         }
@@ -75,10 +77,29 @@ extension ToolExecutor {
             "width": Int(renderSize.width),
             "height": Int(renderSize.height),
             "totalFrames": totalFrames,
-            "frameNumbers": renderedFrames,
+            "coordinateGrid": InspectFrameOverlay.metadataNote,
+            "frames": renderedFrames.map { frame -> [String: Any] in
+                ["frame": frame, "clips": Self.visibleClips(at: frame, in: timeline)]
+            },
         ]
         guard let metaJSON = Self.jsonString(meta) else { throw ToolError("Failed to encode metadata") }
         return ToolResult(content: imageBlocks + [.text(metaJSON)], isError: false)
+    }
+
+    /// Ids of visual clips on screen at `frame`, top track first; caption clips report their group id once.
+    static func visibleClips(at frame: Int, in timeline: Timeline) -> [String] {
+        var ids: [String] = []
+        var seenGroups = Set<String>()
+        for track in timeline.tracks where track.type == .video && !track.hidden {
+            for clip in track.clips where clip.startFrame <= frame && frame < clip.startFrame + clip.durationFrames {
+                if let gid = clip.captionGroupId {
+                    if seenGroups.insert(gid).inserted { ids.append(gid) }
+                } else {
+                    ids.append(clip.id)
+                }
+            }
+        }
+        return ids
     }
 
     /// Aspect-preserving size whose longest edge is at most `longestEdge`.

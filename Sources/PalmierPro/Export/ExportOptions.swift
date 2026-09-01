@@ -2,11 +2,13 @@ import AVFoundation
 
 enum ExportFormat {
     case h264, h265, prores, xml, fcpxml
+    /// HEVC Main10, BT.2020 + HLG — preserves 10-bit HDR (via AVAssetWriter).
+    case hevcHDR
 
     var fileExtension: String {
         switch self {
         case .h264, .h265: "mp4"
-        case .prores: "mov"
+        case .prores, .hevcHDR: "mov"
         case .xml: "xml"
         case .fcpxml: "fcpxml"
         }
@@ -15,10 +17,12 @@ enum ExportFormat {
     var utType: AVFileType? {
         switch self {
         case .h264, .h265: .mp4
-        case .prores: .mov
+        case .prores, .hevcHDR: .mov
         case .xml, .fcpxml: nil
         }
     }
+
+    var isHDR: Bool { self == .hevcHDR }
 }
 
 enum ExportResolution: String, CaseIterable, Identifiable {
@@ -29,6 +33,10 @@ enum ExportResolution: String, CaseIterable, Identifiable {
     case matchTimeline = "Match Timeline"
 
     var id: String { rawValue }
+
+    var title: String {
+        self == .matchTimeline ? L10n.key("Match Timeline") : rawValue
+    }
 
     var shortSidePixels: Int? {
         switch self {
@@ -59,13 +67,14 @@ enum VideoCodec: String, CaseIterable, Identifiable {
     case h264 = "H.264"
     case h265 = "H.265"
     case prores = "ProRes"
+    case hdr = "HEVC 10-bit HDR"
 
     var id: String { rawValue }
 
     var containerLabel: String {
         switch self {
         case .h264, .h265: "MPEG-4 (.mp4)"
-        case .prores: "QuickTime (.mov)"
+        case .prores, .hdr: "QuickTime (.mov)"
         }
     }
 
@@ -74,6 +83,7 @@ enum VideoCodec: String, CaseIterable, Identifiable {
         case .h264: .h264
         case .h265: .h265
         case .prores: .prores
+        case .hdr: .hevcHDR
         }
     }
 
@@ -82,6 +92,7 @@ enum VideoCodec: String, CaseIterable, Identifiable {
         case .h264: self = .h264
         case .h265: self = .h265
         case .prores: self = .prores
+        case .hevcHDR: self = .hdr
         case .xml, .fcpxml: return nil
         }
     }
